@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Dashboard</h1>
+<div class="row mt-4">
+    <div class="col-md-3"><div class="card stat-card bg-primary text-white">
+        <div class="stat-number">{{ total_targets }}</div><div>Total Targets</div></div></div>
+    <div class="col-md-3"><div class="card stat-card bg-info text-white">
+        <div class="stat-number">{{ sent_count }}</div><div>Emails Sent (30d)</div></div></div>
+    <div class="col-md-3"><div class="card stat-card bg-warning text-white">
+        <div class="stat-number">{{ click_rate }}%</div><div>Click Rate</div></div></div>
+    <div class="col-md-3"><div class="card stat-card bg-success text-white">
+        <div class="stat-number">{{ report_rate }}%</div><div>Report Rate</div></div></div>
+</div>
+<div class="card mt-4 p-4">
+    <h4>Recent Activity (30 days)</h4>
+    <p>✅ {{ reported_count }} emails reported as phishing (great!)</p>
+    <p>⚠️ {{ clicked_count }} link clicks</p>
+    <p>🚨 {{ creds_count }} credentials submitted</p>
+</div>
+<div class="mt-4">
+    <a href="{{ url_for('new_campaign') }}" class="btn btn-primary btn-lg">Launch New Campaign</a>
+    <a href="{{ url_for('targets') }}" class="btn btn-secondary btn-lg">Manage Targets</a>
+</div>
+{% endblock %}

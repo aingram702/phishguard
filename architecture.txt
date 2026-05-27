@@ -1,0 +1,27 @@
+┌─────────────────────────────────────────────────────────────┐
+│                    PHISHING SIM PLATFORM                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  [Admin Dashboard]  ──>  [Campaign Manager]                  │
+│       (Flask)                  │                              │
+│                                ↓                              │
+│                    [AI Email Generator] (Claude)             │
+│                                │                              │
+│                                ↓                              │
+│                    [SendGrid] ──> Target Inbox               │
+│                                                               │
+│  Target clicks link ──> [Tracking Server] ──> [DB]           │
+│                                │                              │
+│                                ↓                              │
+│                    [Landing Page]                            │
+│                                │                              │
+│                                ↓                              │
+│                    [AI Training Generator] (Claude)          │
+│                                │                              │
+│                                ↓                              │
+│                    [Quiz + Completion Tracking]              │
+│                                │                              │
+│                                ↓                              │
+│  [Manager Reports] <── [Stats Engine] ──> [Stripe Billing]   │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
