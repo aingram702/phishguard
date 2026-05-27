@@ -1,0 +1,14 @@
+# 1. Initialize the database
+flask --app app init-db
+
+# 2. Local test
+python app.py
+
+# 3. Production with gunicorn (behind nginx)
+gunicorn -w 4 -b 0.0.0.0:5000 app:app
+
+# 4. Required DNS setup for production:
+#    - A record:    phish.yourdomain.com → your server IP
+#    - SPF record:  v=spf1 include:sendgrid.net ~all
+#    - DKIM:        Set up via SendGrid dashboard
+#    - DMARC:       v=DMARC1; p=quarantine; rua=mailto:dmarc@yourdomain.com
