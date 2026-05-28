@@ -5,10 +5,56 @@ Claude-powered email and training content generators
 
 import os
 import json
+import logging
+import bleach
 import anthropic
-from typing import Dict, List
+from typing import Dict
+
+logger = logging.getLogger(__name__)
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML sanitization config (M-6)
+# Allow the subset of HTML tags/attributes that make up reasonable training content.
+# Scripts, iframes, and event handlers are stripped out unconditionally.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ALLOWED_TAGS = list(bleach.sanitizer.ALLOWED_TAGS) + [
+    "div", "span", "p", "br", "hr",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+    "ul", "ol", "li",
+    "table", "thead", "tbody", "tr", "th", "td",
+    "strong", "em", "b", "i", "u", "s",
+    "blockquote", "pre", "code",
+    "img",
+]
+
+_ALLOWED_ATTRIBUTES = {
+    **bleach.sanitizer.ALLOWED_ATTRIBUTES,
+    "*": ["style", "class", "id"],
+    "a": ["href", "title", "target", "rel"],
+    "img": ["src", "alt", "width", "height", "style"],
+    "table": ["border", "cellpadding", "cellspacing", "width", "style"],
+    "td": ["colspan", "rowspan", "style", "align", "valign", "width"],
+    "th": ["colspan", "rowspan", "style", "align", "valign", "width"],
+}
+
+# Restrict allowed URL schemes — data: and javascript: are stripped
+_ALLOWED_PROTOCOLS = {"http", "https", "mailto"}
+
+
+def _sanitize_html(html: str) -> str:
+    """Strip dangerous tags/attributes from AI-generated HTML (M-6 / C-3)."""
+    return bleach.clean(
+        html,
+        tags=_ALLOWED_TAGS,
+        attributes=_ALLOWED_ATTRIBUTES,
+        protocols=_ALLOWED_PROTOCOLS,
+        strip=True,
+        strip_comments=True,
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scenario library — each represents a real-world attack pattern
@@ -169,7 +215,11 @@ def generate_training_content(
     company_name: str,
     email_they_received: str
 ) -> Dict:
-    """Generate personalized post-click training content with quiz."""
+    """Generate personalized post-click training content with quiz.
+    
+    The returned training_html is sanitized with bleach before being returned,
+    so it is safe to store directly in the database (M-6 / C-3).
+    """
 
     scenario = SCENARIO_LIBRARY.get(scenario_key, SCENARIO_LIBRARY["it_password_reset"])
 
@@ -222,7 +272,12 @@ Respond with ONLY valid JSON, no markdown fences:
 
     raw = response.content[0].text.strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
+    data = json.loads(raw)
+
+    # M-6 / C-3: Sanitize AI-generated HTML before returning
+    data["training_html"] = _sanitize_html(data.get("training_html", ""))
+
+    return data
 
 
 def generate_manager_summary(campaign_stats: Dict, company_name: str) -> str:

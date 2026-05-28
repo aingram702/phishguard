@@ -4,12 +4,20 @@ Main Flask application — admin dashboard + tracking endpoints
 """
 
 import os
+import re
+import hmac
+import hashlib
 import json
+import logging
 import stripe
-from datetime import datetime, timedelta
-from flask import Flask, request, render_template, render_template_string, redirect, url_for, jsonify, flash, send_file
+from datetime import datetime, timezone, timedelta
+from flask import Flask, request, render_template, redirect, url_for, jsonify, flash, send_file, abort
 from flask_login import LoginManager, login_required, login_user, logout_user, current_user
 from flask_bcrypt import Bcrypt
+from flask_wtf.csrf import CSRFProtect
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_talisman import Talisman
 from io import BytesIO
 import pandas as pd
 
@@ -17,38 +25,149 @@ from models import db, Organization, User, Target, Campaign, CampaignSend, Train
 from ai_generators import generate_phishing_email, generate_training_content, generate_manager_summary, SCENARIO_LIBRARY
 from email_engine import send_phishing_email, send_manager_summary
 
+# ─── Logging ──────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ─── App Configuration ────────────────────────────────────────────────────────
+
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY")
+
+# C-1 / H-1: Enforce presence of SECRET_KEY — fail fast rather than run insecurely
+_secret_key = os.getenv("FLASK_SECRET_KEY")
+if not _secret_key:
+    raise RuntimeError(
+        "FLASK_SECRET_KEY environment variable is not set. "
+        "Set it to a long random string before starting the server."
+    )
+app.config["SECRET_KEY"] = _secret_key
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///phishing_sim.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["WTF_CSRF_ENABLED"] = True
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # H-4: 5 MB upload limit
+
+# HMAC key for send_id signing (H-3 / H-5)
+_HMAC_SECRET = os.getenv("SEND_ID_HMAC_SECRET", _secret_key).encode()
 
 db.init_app(app)
 bcrypt = Bcrypt(app)
+csrf = CSRFProtect(app)  # C-1: CSRF protection for all forms
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-@login_manager.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
+# C-4: Rate limiter — storage URI can be overridden with RATELIMIT_STORAGE_URI env var
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=["200 per minute"],
+    storage_uri=os.getenv("RATELIMIT_STORAGE_URI", "memory://")
+)
+
+# M-5: Secure HTTP headers
+# CSP is permissive enough for Bootstrap CDN + inline styles needed for email previews
+_csp = {
+    "default-src": ["'self'"],
+    "script-src": ["'self'", "'unsafe-inline'", "cdn.jsdelivr.net"],
+    "style-src": ["'self'", "'unsafe-inline'", "cdn.jsdelivr.net"],
+    "img-src": ["'self'", "data:"],
+    "font-src": ["'self'", "fonts.googleapis.com", "fonts.gstatic.com"],
+    "frame-ancestors": ["'none'"],
+}
+Talisman(
+    app,
+    force_https=os.getenv("FLASK_ENV") == "production",
+    strict_transport_security=os.getenv("FLASK_ENV") == "production",
+    content_security_policy=_csp,
+    x_content_type_options=True,
+    x_frame_options="DENY",
+    referrer_policy="strict-origin-when-cross-origin",
+)
+
+# H-2: Only set Stripe key if the env var actually exists
+if os.getenv("STRIPE_SECRET_KEY"):
+    stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+
+# ─── HMAC Utilities ───────────────────────────────────────────────────────────
+
+def _sign_send_id(raw_id: str) -> str:
+    """Return send_id with an HMAC suffix: '<uuid>.<hmac>'."""
+    sig = hmac.new(_HMAC_SECRET, raw_id.encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{raw_id}.{sig}"
+
+
+def _verify_send_id(signed_id: str) -> str | None:
+    """Verify the HMAC and return the raw UUID, or None if invalid."""
+    parts = signed_id.rsplit(".", 1)
+    if len(parts) != 2:
+        return None
+    raw_id, provided_sig = parts
+    expected_sig = hmac.new(_HMAC_SECRET, raw_id.encode(), hashlib.sha256).hexdigest()[:16]
+    if hmac.compare_digest(provided_sig, expected_sig):
+        return raw_id
+    return None
+
+
+# ─── Allowed flash categories whitelist (M-2) ────────────────────────────────
+
+_SAFE_FLASH_CATEGORIES = {"success", "error", "warning", "info"}
+
+
+def safe_flash(message: str, category: str = "info") -> None:
+    """Flash a message, ensuring the category is a known safe value."""
+    if category not in _SAFE_FLASH_CATEGORIES:
+        category = "info"
+    flash(message, category)
 
 
 # ─── Auth ──────────────────────────────────────────────────────────────────────
 
+@login_manager.user_loader
+def load_user(user_id):
+    return db.session.get(User, int(user_id))  # L-2: SQLAlchemy 2.0 compat
+
+
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
     if request.method == "POST":
-        org = Organization(
-            name=request.form["company_name"],
-            domain=request.form["company_domain"]
-        )
+        company_name = request.form.get("company_name", "").strip()
+        company_domain = request.form.get("company_domain", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+
+        # M-1: Input validation
+        if not company_name or len(company_name) > 200:
+            safe_flash("Company name must be between 1 and 200 characters.", "error")
+            return render_template("signup.html")
+        if not company_domain or len(company_domain) > 200:
+            safe_flash("Company domain must be between 1 and 200 characters.", "error")
+            return render_template("signup.html")
+        if not _is_valid_email(email):
+            safe_flash("Invalid email address.", "error")
+            return render_template("signup.html")
+        if len(password) < 12:
+            safe_flash("Password must be at least 12 characters.", "error")
+            return render_template("signup.html")
+        if len(password) > 128:
+            safe_flash("Password must be 128 characters or fewer.", "error")
+            return render_template("signup.html")
+
+        if User.query.filter_by(email=email).first():
+            safe_flash("An account with that email already exists.", "error")
+            return render_template("signup.html")
+
+        org = Organization(name=company_name, domain=company_domain)
         db.session.add(org)
         db.session.flush()
 
         user = User(
             org_id=org.id,
-            email=request.form["email"],
-            password_hash=bcrypt.generate_password_hash(request.form["password"]).decode("utf-8")
+            email=email,
+            password_hash=bcrypt.generate_password_hash(password).decode("utf-8")
         )
         db.session.add(user)
         db.session.commit()
@@ -61,11 +180,13 @@ def signup():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        user = User.query.filter_by(email=request.form["email"]).first()
-        if user and bcrypt.check_password_hash(user.password_hash, request.form["password"]):
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        user = User.query.filter_by(email=email).first()
+        if user and bcrypt.check_password_hash(user.password_hash, password):
             login_user(user)
             return redirect(url_for("dashboard"))
-        flash("Invalid credentials", "error")
+        safe_flash("Invalid credentials", "error")
     return render_template("login.html")
 
 
@@ -87,7 +208,7 @@ def dashboard():
 
     recent_sends = db.session.query(CampaignSend).join(Campaign).filter(
         Campaign.org_id == org_id,
-        CampaignSend.sent_at >= datetime.utcnow() - timedelta(days=30)
+        CampaignSend.sent_at >= datetime.now(timezone.utc) - timedelta(days=30)  # L-1
     ).all()
 
     sent_count = len(recent_sends)
@@ -123,29 +244,53 @@ def targets():
 @login_required
 def upload_targets():
     """Bulk upload targets via CSV. CSV columns: email, first_name, last_name, department, job_title"""
-    file = request.files["csv"]
-    df = pd.read_csv(file)
+    # H-4: File type and size validation
+    file = request.files.get("csv")
+    if not file or not file.filename:
+        safe_flash("No file uploaded.", "error")
+        return redirect(url_for("targets"))
 
+    if not file.filename.lower().endswith(".csv"):
+        safe_flash("Only .csv files are accepted.", "error")
+        return redirect(url_for("targets"))
+
+    try:
+        df = pd.read_csv(file)
+    except Exception as e:
+        logger.warning("CSV parse error from org %s: %s", current_user.org_id, type(e).__name__)
+        safe_flash("Could not parse the uploaded file. Ensure it is a valid CSV.", "error")
+        return redirect(url_for("targets"))
+
+    if "email" not in df.columns:
+        safe_flash("CSV must contain an 'email' column.", "error")
+        return redirect(url_for("targets"))
+
+    imported = 0
     for _, row in df.iterrows():
+        email = str(row.get("email", "")).strip().lower()
+        if not _is_valid_email(email):
+            continue
+
         existing = Target.query.filter_by(
             org_id=current_user.org_id,
-            email=row["email"]
+            email=email
         ).first()
         if existing:
             continue
 
         target = Target(
             org_id=current_user.org_id,
-            email=row["email"],
-            first_name=row.get("first_name", ""),
-            last_name=row.get("last_name", ""),
-            department=row.get("department", ""),
-            job_title=row.get("job_title", "")
+            email=email,
+            first_name=str(row.get("first_name", ""))[:100],
+            last_name=str(row.get("last_name", ""))[:100],
+            department=str(row.get("department", ""))[:100],
+            job_title=str(row.get("job_title", ""))[:150]
         )
         db.session.add(target)
+        imported += 1
 
     db.session.commit()
-    flash(f"Imported {len(df)} targets", "success")
+    safe_flash(f"Imported {imported} targets", "success")
     return redirect(url_for("targets"))
 
 
@@ -156,25 +301,36 @@ def upload_targets():
 def new_campaign():
     if request.method == "POST":
         target_ids = request.form.getlist("target_ids")
-        scenario = request.form["scenario"]
-        difficulty = request.form["difficulty"]
+        scenario = request.form.get("scenario", "")
+        difficulty = request.form.get("difficulty", "medium")
+        name = request.form.get("name", "").strip()
+
+        # Whitelist scenario and difficulty to known values
+        if scenario not in SCENARIO_LIBRARY:
+            safe_flash("Invalid scenario selected.", "error")
+            return redirect(url_for("new_campaign"))
+        if difficulty not in ("easy", "medium", "hard"):
+            difficulty = "medium"
+        if not name or len(name) > 200:
+            safe_flash("Campaign name must be between 1 and 200 characters.", "error")
+            return redirect(url_for("new_campaign"))
 
         campaign = Campaign(
             org_id=current_user.org_id,
-            name=request.form["name"],
+            name=name,
             scenario=scenario,
             difficulty=difficulty,
             status="sending",
-            sent_at=datetime.utcnow()
+            sent_at=datetime.now(timezone.utc)  # L-1
         )
         db.session.add(campaign)
         db.session.flush()
 
-        org = Organization.query.get(current_user.org_id)
+        org = db.session.get(Organization, current_user.org_id)  # L-2
         sent_count = 0
 
         for target_id in target_ids:
-            target = Target.query.get(target_id)
+            target = db.session.get(Target, int(target_id)) if str(target_id).isdigit() else None  # L-2
             if not target or target.org_id != current_user.org_id:
                 continue
 
@@ -196,7 +352,7 @@ def new_campaign():
 
         campaign.status = "sent"
         db.session.commit()
-        flash(f"Campaign launched: {sent_count} emails sent", "success")
+        safe_flash(f"Campaign launched: {sent_count} emails sent", "success")
         return redirect(url_for("campaign_detail", campaign_id=campaign.id))
 
     targets = Target.query.filter_by(org_id=current_user.org_id).all()
@@ -206,9 +362,11 @@ def new_campaign():
 @app.route("/campaigns/<int:campaign_id>")
 @login_required
 def campaign_detail(campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = db.session.get(Campaign, campaign_id)  # L-2
+    if campaign is None:
+        abort(404)
     if campaign.org_id != current_user.org_id:
-        return "Forbidden", 403
+        abort(403)
 
     sends = CampaignSend.query.filter_by(campaign_id=campaign_id).all()
     stats = {
@@ -222,7 +380,7 @@ def campaign_detail(campaign_id):
 
     detail_rows = []
     for send in sends:
-        target = Target.query.get(send.target_id)
+        target = db.session.get(Target, send.target_id)  # L-2
         detail_rows.append({
             "target": target,
             "send": send,
@@ -246,12 +404,22 @@ def _compute_status(send):
 
 # ─── Tracking Endpoints ────────────────────────────────────────────────────────
 
+def _resolve_send(signed_id: str) -> CampaignSend | None:
+    """Verify HMAC and look up the CampaignSend record. Returns None on failure."""
+    raw_id = _verify_send_id(signed_id)
+    if raw_id is None:
+        return None
+    return db.session.get(CampaignSend, raw_id)  # L-2
+
+
 @app.route("/o/<send_id>")
+@limiter.limit("60 per minute")  # C-4: rate limit
+@csrf.exempt  # Tracking pixels are plain GET requests, no form
 def track_open(send_id):
     """1x1 tracking pixel — records email open."""
-    send = CampaignSend.query.get(send_id)
+    send = _resolve_send(send_id)  # H-5: HMAC check
     if send and not send.opened_at:
-        send.opened_at = datetime.utcnow()
+        send.opened_at = datetime.now(timezone.utc)  # L-1
         db.session.commit()
 
     pixel = bytes.fromhex("47494638396101000100800000ffffff00000021f90401000000002c00000000010001000002024401003b")
@@ -259,82 +427,85 @@ def track_open(send_id):
 
 
 @app.route("/c/<send_id>")
+@limiter.limit("20 per minute")  # C-4
+@csrf.exempt
 def track_click(send_id):
     """Phishing link landing page."""
-    send = CampaignSend.query.get(send_id)
+    send = _resolve_send(send_id)  # H-5
     if not send:
         return "Link expired", 404
 
     if not send.clicked_at:
-        send.clicked_at = datetime.utcnow()
-        target = Target.query.get(send.target_id)
-        target.total_clicks += 1
+        send.clicked_at = datetime.now(timezone.utc)  # L-1
+        target = db.session.get(Target, send.target_id)  # L-2
+        if target:
+            target.total_clicks += 1
         db.session.commit()
 
     return render_template("fake_login.html", send_id=send_id)
 
 
 @app.route("/c/<send_id>/submit", methods=["POST"])
+@limiter.limit("20 per minute")  # C-4
+@csrf.exempt  # Public endpoint — no session to protect; payload is intentionally discarded
 def track_credentials_submission(send_id):
     """User submitted creds on fake login — record but DO NOT store the actual creds."""
-    send = CampaignSend.query.get(send_id)
+    send = _resolve_send(send_id)  # H-5
     if not send:
         return "Link expired", 404
 
+    # Explicitly discard any submitted credentials — never log or store them
+    # (Email/password fields are intentionally ignored here)
+
     if not send.credentials_submitted_at:
-        send.credentials_submitted_at = datetime.utcnow()
-        target = Target.query.get(send.target_id)
-        target.total_credentials_submitted += 1
+        send.credentials_submitted_at = datetime.now(timezone.utc)  # L-1
+        target = db.session.get(Target, send.target_id)  # L-2
+        if target:
+            target.total_credentials_submitted += 1
         db.session.commit()
 
     return redirect(url_for("training", send_id=send_id))
 
 
 @app.route("/r/<send_id>")
+@limiter.limit("20 per minute")  # C-4
+@csrf.exempt
 def track_report(send_id):
     """User clicked the 'Report Phishing' link in the footer — good catch."""
-    send = CampaignSend.query.get(send_id)
+    send = _resolve_send(send_id)  # H-5
     if not send:
         return "Link expired", 404
 
     if not send.reported_at:
-        send.reported_at = datetime.utcnow()
-        target = Target.query.get(send.target_id)
-        target.total_reports += 1
+        send.reported_at = datetime.now(timezone.utc)  # L-1
+        target = db.session.get(Target, send.target_id)  # L-2
+        if target:
+            target.total_reports += 1
         db.session.commit()
 
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html><head><title>Great Catch!</title>
-    <style>body { font-family: Arial; text-align: center; padding: 80px; background: #f0f8ff; }
-           h1 { color: #28a745; } .box { background: white; padding: 40px; border-radius: 10px;
-           max-width: 500px; margin: 0 auto; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }</style>
-    </head><body>
-    <div class="box">
-      <h1>🎉 Great Catch!</h1>
-      <p>You correctly identified that email as a phishing simulation.</p>
-      <p>This is exactly the right behavior — thank you for staying alert!</p>
-    </div></body></html>
-    """)
+    # C-2: Use a real template instead of render_template_string
+    return render_template("report_success.html")
 
 
 # ─── Training ──────────────────────────────────────────────────────────────────
 
 @app.route("/training/<send_id>")
+@limiter.limit("30 per minute")  # C-4
+@csrf.exempt
 def training(send_id):
-    send = CampaignSend.query.get(send_id)
+    send = _resolve_send(send_id)  # H-5
     if not send:
         return "Link expired", 404
 
-    target = Target.query.get(send.target_id)
-    campaign = Campaign.query.get(send.campaign_id)
-    org = Organization.query.get(target.org_id)
+    target = db.session.get(Target, send.target_id)  # L-2
+    campaign = db.session.get(Campaign, send.campaign_id)  # L-2
+    org = db.session.get(Organization, target.org_id)  # L-2
 
     if not send.training_started_at:
-        send.training_started_at = datetime.utcnow()
+        send.training_started_at = datetime.now(timezone.utc)  # L-1
         db.session.commit()
 
-    module = TrainingModule.query.filter_by(send_id=send_id).first()
+    module = TrainingModule.query.filter_by(send_id=_verify_send_id(send_id)).first()
     if not module:
         training_data = generate_training_content(
             scenario_key=campaign.scenario,
@@ -343,8 +514,8 @@ def training(send_id):
             email_they_received=send.email_body
         )
         module = TrainingModule(
-            send_id=send_id,
-            content_html=training_data["training_html"],
+            send_id=_verify_send_id(send_id),
+            content_html=training_data["training_html"],  # Sanitized in ai_generators.py (M-6)
             quiz_json=json.dumps(training_data["quiz"])
         )
         db.session.add(module)
@@ -358,16 +529,26 @@ def training(send_id):
 
 
 @app.route("/training/<send_id>/complete", methods=["POST"])
+@limiter.limit("10 per minute")  # C-4
+@csrf.exempt
 def complete_training(send_id):
-    send = CampaignSend.query.get(send_id)
+    send = _resolve_send(send_id)  # H-5
     if not send:
         return "Not found", 404
 
-    data = request.get_json()
-    send.training_quiz_score = data.get("score", 0)
-    send.training_completed_at = datetime.utcnow()
-    target = Target.query.get(send.target_id)
-    target.total_trainings_completed += 1
+    data = request.get_json(silent=True) or {}
+    # M-7: Clamp and validate the quiz score
+    try:
+        score = int(data.get("score", 0))
+    except (TypeError, ValueError):
+        score = 0
+    score = max(0, min(100, score))  # Clamp to 0-100
+
+    send.training_quiz_score = score
+    send.training_completed_at = datetime.now(timezone.utc)  # L-1
+    target = db.session.get(Target, send.target_id)  # L-2
+    if target:
+        target.total_trainings_completed += 1
     db.session.commit()
 
     return jsonify({"status": "complete"})
@@ -378,14 +559,16 @@ def complete_training(send_id):
 @app.route("/campaigns/<int:campaign_id>/export")
 @login_required
 def export_campaign(campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = db.session.get(Campaign, campaign_id)  # L-2
+    if campaign is None:
+        abort(404)
     if campaign.org_id != current_user.org_id:
-        return "Forbidden", 403
+        abort(403)
 
     sends = CampaignSend.query.filter_by(campaign_id=campaign_id).all()
     rows = []
     for send in sends:
-        target = Target.query.get(send.target_id)
+        target = db.session.get(Target, send.target_id)  # L-2
         rows.append({
             "Email": target.email,
             "Name": f"{target.first_name} {target.last_name}",
@@ -410,6 +593,16 @@ def export_campaign(campaign_id):
         download_name=f"campaign_{campaign_id}_report.xlsx")
 
 
+# ─── Utilities ────────────────────────────────────────────────────────────────
+
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+
+
+def _is_valid_email(email: str) -> bool:
+    """Basic RFC-ish email format check."""
+    return bool(email and len(email) <= 200 and _EMAIL_RE.match(email))
+
+
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
 @app.cli.command("init-db")
@@ -421,4 +614,4 @@ def init_db():
 if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="127.0.0.1", port=5000, debug=False)  # Bind to localhost only in dev

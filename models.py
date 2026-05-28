@@ -3,11 +3,17 @@ models.py
 Full SQLAlchemy data model for the phishing sim platform
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import UserMixin
 
 db = SQLAlchemy()
+
+
+def _utcnow():
+    """L-1: timezone-aware UTC timestamp (datetime.utcnow is deprecated in Python 3.12+)."""
+    return datetime.now(timezone.utc)
+
 
 class Organization(db.Model):
     """A customer company using the platform."""
@@ -18,7 +24,7 @@ class Organization(db.Model):
     subscription_tier = db.Column(db.String(50), default="starter")
     stripe_customer_id = db.Column(db.String(100))
     stripe_subscription_id = db.Column(db.String(100))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), default=_utcnow)
 
     users = db.relationship("User", backref="organization", lazy=True)
     targets = db.relationship("Target", backref="organization", lazy=True)
@@ -33,7 +39,7 @@ class User(db.Model, UserMixin):
     email = db.Column(db.String(200), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(50), default="admin")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), default=_utcnow)
 
 
 class Target(db.Model):
@@ -52,7 +58,7 @@ class Target(db.Model):
     total_credentials_submitted = db.Column(db.Integer, default=0)
     total_reports = db.Column(db.Integer, default=0)
     total_trainings_completed = db.Column(db.Integer, default=0)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime(timezone=True), default=_utcnow)
 
 
 class Campaign(db.Model):
@@ -64,10 +70,10 @@ class Campaign(db.Model):
     scenario = db.Column(db.String(100))
     difficulty = db.Column(db.String(20), default="medium")
     status = db.Column(db.String(50), default="draft")
-    scheduled_for = db.Column(db.DateTime)
-    sent_at = db.Column(db.DateTime)
-    completed_at = db.Column(db.DateTime)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    scheduled_for = db.Column(db.DateTime(timezone=True))
+    sent_at = db.Column(db.DateTime(timezone=True))
+    completed_at = db.Column(db.DateTime(timezone=True))
+    created_at = db.Column(db.DateTime(timezone=True), default=_utcnow)
 
     sends = db.relationship("CampaignSend", backref="campaign", lazy=True)
 
@@ -75,6 +81,7 @@ class Campaign(db.Model):
 class CampaignSend(db.Model):
     """A single email sent to one target in one campaign."""
     __tablename__ = "campaign_sends"
+    # id stores '<uuid>.<hmac>' — max 32 (uuid hex) + 1 (dot) + 16 (hmac) = 49 chars
     id = db.Column(db.String(64), primary_key=True)
     campaign_id = db.Column(db.Integer, db.ForeignKey("campaigns.id"))
     target_id = db.Column(db.Integer, db.ForeignKey("targets.id"))
@@ -82,13 +89,13 @@ class CampaignSend(db.Model):
     email_body = db.Column(db.Text)
     sender_email = db.Column(db.String(200))
     sender_name = db.Column(db.String(200))
-    sent_at = db.Column(db.DateTime)
-    opened_at = db.Column(db.DateTime)
-    clicked_at = db.Column(db.DateTime)
-    credentials_submitted_at = db.Column(db.DateTime)
-    reported_at = db.Column(db.DateTime)
-    training_started_at = db.Column(db.DateTime)
-    training_completed_at = db.Column(db.DateTime)
+    sent_at = db.Column(db.DateTime(timezone=True))
+    opened_at = db.Column(db.DateTime(timezone=True))
+    clicked_at = db.Column(db.DateTime(timezone=True))
+    credentials_submitted_at = db.Column(db.DateTime(timezone=True))
+    reported_at = db.Column(db.DateTime(timezone=True))
+    training_started_at = db.Column(db.DateTime(timezone=True))
+    training_completed_at = db.Column(db.DateTime(timezone=True))
     training_quiz_score = db.Column(db.Integer)
 
 
@@ -97,6 +104,6 @@ class TrainingModule(db.Model):
     __tablename__ = "training_modules"
     id = db.Column(db.Integer, primary_key=True)
     send_id = db.Column(db.String(64), db.ForeignKey("campaign_sends.id"))
-    content_html = db.Column(db.Text)
+    content_html = db.Column(db.Text)   # Sanitized by bleach before storage (M-6)
     quiz_json = db.Column(db.Text)
-    generated_at = db.Column(db.DateTime, default=datetime.utcnow)
+    generated_at = db.Column(db.DateTime(timezone=True), default=_utcnow)

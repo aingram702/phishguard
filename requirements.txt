@@ -1,4 +1,28 @@
-numpy==2.4.6
-pandas==3.0.3
-python-dateutil==2.9.0.post0
-six==1.17.0
+# ─── Core Framework ───────────────────────────────────────────────────────────
+flask==3.0.0
+flask-sqlalchemy==3.1.1
+flask-login==0.6.3
+flask-bcrypt==1.0.1
+flask-wtf==1.2.1          # C-1: CSRF protection
+
+# ─── Security Hardening ───────────────────────────────────────────────────────
+flask-talisman==1.1.0     # M-5: Secure HTTP headers (CSP, HSTS, X-Frame-Options, etc.)
+flask-limiter==3.5.0      # C-4: Rate limiting on tracking/public endpoints
+bleach==6.1.0             # M-6 / C-3: HTML sanitization of AI-generated content
+
+# ─── AI / External APIs ───────────────────────────────────────────────────────
+anthropic==0.39.0
+sendgrid==6.11.0
+stripe==7.0.0
+
+# ─── Data Handling ────────────────────────────────────────────────────────────
+pandas==2.1.4
+openpyxl==3.1.2           # Required by pandas Excel export
+numpy==1.26.4
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+python-dotenv==1.0.0
+python-dateutil==2.8.2
+gunicorn==21.2.0
+requests==2.31.0
+sqlalchemy==2.0.23
