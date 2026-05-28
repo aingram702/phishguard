@@ -36,8 +36,10 @@
     <div class="container py-4">
         {% with messages = get_flashed_messages(with_categories=true) %}
             {% for category, message in messages %}
-                {# M-2: Only render known-safe Bootstrap alert category classes #}
-                {% if category in ['success', 'error', 'warning', 'info'] %}
+                {# M-2: Map 'error' to Bootstrap's 'danger'; only render known-safe classes #}
+                {% if category == 'error' %}
+                    <div class="alert alert-danger">{{ message }}</div>
+                {% elif category in ['success', 'warning', 'info'] %}
                     <div class="alert alert-{{ category }}">{{ message }}</div>
                 {% else %}
                     <div class="alert alert-info">{{ message }}</div>
