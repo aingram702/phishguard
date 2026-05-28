@@ -132,6 +132,7 @@ def load_user(user_id):
 
 
 @app.route("/signup", methods=["GET", "POST"])
+@limiter.limit("10 per hour")
 def signup():
     if request.method == "POST":
         company_name = request.form.get("company_name", "").strip()
@@ -178,6 +179,7 @@ def signup():
 
 
 @app.route("/login", methods=["GET", "POST"])
+@limiter.limit("20 per minute; 100 per hour")
 def login():
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
@@ -404,12 +406,18 @@ def _compute_status(send):
 
 # ─── Tracking Endpoints ────────────────────────────────────────────────────────
 
+_MAX_SEND_ID_LEN = 64  # 32 (uuid hex) + 1 (dot) + 16 (hmac) = 49; 64 gives headroom
+
+
 def _resolve_send(signed_id: str) -> CampaignSend | None:
     """Verify HMAC and look up the CampaignSend record. Returns None on failure."""
+    if not signed_id or len(signed_id) > _MAX_SEND_ID_LEN:
+        return None
     raw_id = _verify_send_id(signed_id)
     if raw_id is None:
         return None
-    return db.session.get(CampaignSend, raw_id)  # L-2
+    # CampaignSend.id stores the full signed_id (not the raw UUID), so look up by signed_id
+    return db.session.get(CampaignSend, signed_id)
 
 
 @app.route("/o/<send_id>")
@@ -505,7 +513,8 @@ def training(send_id):
         send.training_started_at = datetime.now(timezone.utc)  # L-1
         db.session.commit()
 
-    module = TrainingModule.query.filter_by(send_id=_verify_send_id(send_id)).first()
+    # TrainingModule.send_id is a FK to CampaignSend.id, which stores the full signed_id
+    module = TrainingModule.query.filter_by(send_id=send_id).first()
     if not module:
         training_data = generate_training_content(
             scenario_key=campaign.scenario,
@@ -514,7 +523,7 @@ def training(send_id):
             email_they_received=send.email_body
         )
         module = TrainingModule(
-            send_id=_verify_send_id(send_id),
+            send_id=send_id,
             content_html=training_data["training_html"],  # Sanitized in ai_generators.py (M-6)
             quiz_json=json.dumps(training_data["quiz"])
         )

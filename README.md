@@ -8,7 +8,7 @@
 [![Flask](https://img.shields.io/badge/Flask-3.0-000000?style=for-the-badge&logo=flask&logoColor=white)](https://flask.palletsprojects.com)
 [![Claude](https://img.shields.io/badge/Claude-Sonnet_4-D97706?style=for-the-badge&logo=anthropic&logoColor=white)](https://anthropic.com)
 [![License](https://img.shields.io/badge/License-MIT-22C55E?style=for-the-badge)](LICENSE)
-[![Security](https://img.shields.io/badge/Security-Audited-6366F1?style=for-the-badge&logo=shield&logoColor=white)](#security)
+[![Security](https://img.shields.io/badge/Security-Audited-6366F1?style=for-the-badge&logo=shield&logoColor=white)](#-security)
 
 **KnowBe4-style phishing simulation at a fraction of the cost — with AI-personalized emails and adaptive training powered by Claude.**
 
@@ -94,7 +94,7 @@ This platform handles sensitive employee data and simulates attacks — security
 │                                             │                           │
 │                                             ▼                           │
 │                              ┌──────────────────────────┐              │
-│                              │       SendGrid           │              │
+│                              │         Resend            │              │
 │                              │  HMAC-signed tracking    │              │
 │                              │  links embedded in HTML  │              │
 │                              └─────────────┬────────────┘              │
@@ -141,7 +141,7 @@ This platform handles sensitive employee data and simulates attacks — security
 | **Secure Headers** | Flask-Talisman (CSP, HSTS, X-Frame-Options) |
 | **Rate Limiting** | Flask-Limiter |
 | **AI Generation** | Anthropic Claude Sonnet (via `anthropic` SDK) |
-| **Email Delivery** | SendGrid |
+| **Email Delivery** | Resend |
 | **HTML Sanitization** | bleach |
 | **Data Export** | pandas + openpyxl |
 | **Payments** | Stripe (optional) |
@@ -169,7 +169,7 @@ Each scenario has documented **red flags** that the post-click training module e
 
 ### Prerequisites
 - Python 3.11+
-- A [SendGrid](https://sendgrid.com) account with a verified sender domain
+- A [Resend](https://resend.com) account with a verified sending domain
 - An [Anthropic](https://console.anthropic.com) API key
 
 ### 1. Clone and set up
@@ -194,8 +194,8 @@ Open `.env` and fill in your values (see [Configuration](#-configuration) for de
 
 ```bash
 FLASK_SECRET_KEY=<generate with: python -c "import secrets; print(secrets.token_hex(32))">
-SENDGRID_API_KEY=SG.your_key_here
-SENDGRID_FROM_EMAIL=noreply@yourdomain.com
+RESEND_API_KEY=re_your_key_here
+FROM_EMAIL=noreply@yourdomain.com
 ANTHROPIC_API_KEY=sk-ant-your_key_here
 BASE_URL=http://localhost:5000    # Use https:// in production
 ```
@@ -225,8 +225,8 @@ All configuration is via environment variables. Copy `.env.example` to `.env` to
 | Variable | Description |
 |----------|-------------|
 | `FLASK_SECRET_KEY` | Long random string for session signing. **App refuses to start without this.** Generate: `python -c "import secrets; print(secrets.token_hex(32))"` |
-| `SENDGRID_API_KEY` | SendGrid API key for email delivery |
-| `SENDGRID_FROM_EMAIL` | Verified sender email address (must be configured in SendGrid) |
+| `RESEND_API_KEY` | [Resend](https://resend.com) API key for email delivery (starts with `re_`) |
+| `FROM_EMAIL` | Verified sender address (must be from a domain you've verified in your Resend dashboard) |
 | `ANTHROPIC_API_KEY` | Anthropic API key for Claude email/training generation |
 | `BASE_URL` | Public URL of this deployment (e.g., `https://phish.yourcompany.com`). **Must be `https://` in production.** |
 
@@ -240,11 +240,18 @@ All configuration is via environment variables. Copy `.env.example` to `.env` to
 | `FLASK_ENV` | *(unset)* | Set to `production` to enable HTTPS enforcement, HSTS, and startup checks. |
 | `STRIPE_SECRET_KEY` | *(unset)* | Stripe key for billing features. Leave unset to disable. |
 
+### Setting up Resend
+
+1. Sign up at [resend.com](https://resend.com) and create an API key
+2. Add and verify your sending domain in the Resend dashboard
+3. Configure DNS records for your domain as shown in [DNS Setup](#dns-setup-for-email-deliverability)
+4. Set `FROM_EMAIL` to an address at your verified domain (e.g. `phishguard@yourdomain.com`)
+
 ---
 
 ## 🔒 Security
 
-PhishGuard has undergone a full security audit. All identified findings have been remediated. Below is a summary — see [`security_audit.md`](security_audit.md) for complete details.
+PhishGuard has undergone a full security audit. All identified findings have been remediated. Below is a summary — see [`SECURITY.md`](SECURITY.md) for complete details.
 
 ### Remediated Findings
 
@@ -252,16 +259,19 @@ PhishGuard has undergone a full security audit. All identified findings have bee
 |----------|---------|-----|
 | 🔴 Critical | CSRF on all POST endpoints | `Flask-WTF` CSRFProtect on all authenticated routes |
 | 🔴 Critical | SSTI via `render_template_string` | Replaced with static template |
-| 🔴 Critical | Stored XSS from unsanitized AI-generated HTML | `bleach` allowlist sanitization before storage |
+| 🔴 Critical | Stored XSS from unsanitized AI-generated HTML | `bleach` allowlist sanitization before storage; covers phishing emails, training content, and manager summaries |
 | 🔴 Critical | No rate limiting on public tracking endpoints | `Flask-Limiter` (10–60 req/min per endpoint) |
+| 🔴 Critical | Tracking lookup used raw UUID instead of full signed ID | `_resolve_send()` and training route now look up `CampaignSend` by the full HMAC-signed ID |
 | 🟠 High | `SECRET_KEY` silently `None` if env var unset | Startup `RuntimeError` — app refuses to run |
 | 🟠 High | Unguarded Stripe API key assignment | Conditional on env var presence |
 | 🟠 High | CSV upload — no type/size validation | Extension check, 5 MB limit, parse error handling |
 | 🟠 High | Tracking IDs guessable / no integrity check | HMAC-SHA256 signed `send_id` tokens |
+| 🟠 High | No brute-force protection on login/signup | Rate limiting: 20/min · 100/hr on login; 10/hr on signup |
 | 🟡 Medium | No input validation on signup | Email regex, length limits, duplicate check |
 | 🟡 Medium | Email addresses logged in plaintext | Replaced with `sha256(email)[:8]` hex digest |
 | 🟡 Medium | No secure HTTP headers | `Flask-Talisman`: CSP, HSTS, X-Frame-Options |
 | 🟡 Medium | Arbitrary quiz scores accepted | Server-side clamping to 0–100 |
+| 🟡 Medium | Oversized send_id inputs not rejected early | Length check (≤ 64 chars) before HMAC verification |
 | 🔵 Low | `datetime.utcnow()` deprecated (Python 3.12+) | Replaced with `datetime.now(timezone.utc)` |
 | 🔵 Low | Bootstrap CDN without SRI hash | `integrity=` and `crossorigin=` attributes added |
 
@@ -312,13 +322,13 @@ server {
 
 ### DNS Setup for Email Deliverability
 
-For simulation emails to reach inboxes (not spam), configure these DNS records for your sending domain:
+For simulation emails to reach inboxes (not spam), configure these DNS records for your sending domain. Resend provides exact values for steps 2–4 in its dashboard.
 
-| Record | Type | Value |
-|--------|------|-------|
-| SPF | TXT | `v=spf1 include:sendgrid.net ~all` |
-| DKIM | CNAME | Configure in your SendGrid dashboard |
-| DMARC | TXT | `v=DMARC1; p=quarantine; rua=mailto:dmarc@yourdomain.com` |
+| Record | Type | Purpose |
+|--------|------|---------|
+| SPF | TXT | Authorize Resend to send on your domain's behalf |
+| DKIM | TXT | Cryptographic sender authentication |
+| DMARC | TXT | Policy for failed SPF/DKIM: `v=DMARC1; p=quarantine; rua=mailto:dmarc@yourdomain.com` |
 
 ### Database
 
@@ -345,7 +355,7 @@ phishguard/
 ├── app.py                  # Main Flask application, all routes
 ├── models.py               # SQLAlchemy ORM models
 ├── ai_generators.py        # Claude API — email & training generation
-├── email_engine.py         # SendGrid delivery + HMAC tracking IDs
+├── email_engine.py         # Resend delivery + HMAC tracking IDs
 ├── requirements.txt        # All Python dependencies
 ├── .env.example            # Environment variable template
 ├── .gitignore

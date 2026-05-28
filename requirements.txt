@@ -12,7 +12,7 @@ bleach==6.1.0             # M-6 / C-3: HTML sanitization of AI-generated content
 
 # ─── AI / External APIs ───────────────────────────────────────────────────────
 anthropic==0.39.0
-sendgrid==6.11.0
+resend==2.7.0
 stripe==7.0.0
 
 # ─── Data Handling ────────────────────────────────────────────────────────────

@@ -303,4 +303,4 @@ Use plain HTML email formatting. Be encouraging and constructive — frame failu
         messages=[{"role": "user", "content": prompt}]
     )
 
-    return response.content[0].text
+    return _sanitize_html(response.content[0].text)
