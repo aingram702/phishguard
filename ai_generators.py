@@ -159,20 +159,13 @@ def generate_phishing_email(
 
     scenario = SCENARIO_LIBRARY.get(scenario_key, SCENARIO_LIBRARY["it_password_reset"])
 
-    prompt = f"""You are creating a phishing simulation email for a security awareness training program.
+    # Static context (same for all targets in a campaign with the same scenario+difficulty)
+    static_context = f"""You are creating a phishing simulation email for a security awareness training program.
 This is a LEGITIMATE training exercise authorized by the company's IT team — not a real attack.
 
 SCENARIO: {scenario['title']}
 DESCRIPTION: {scenario['description']}
 DIFFICULTY: {difficulty}
-
-TARGET DETAILS:
-- Name: {target_name}
-- First name: {target_first_name}
-- Job title: {target_job_title}
-- Department: {target_department}
-- Company: {company_name}
-- Company domain: {company_domain}
 
 DIFFICULTY GUIDELINES:
 - "easy": Multiple obvious red flags (typos, generic greeting, mismatched domain), should fool 30-40% of people
@@ -198,10 +191,25 @@ Respond with ONLY valid JSON, no markdown fences:
   "preview_text": "30-50 character email preview text"
 }}"""
 
+    # Dynamic context (unique per target)
+    dynamic_context = f"""TARGET DETAILS:
+- Name: {target_name}
+- First name: {target_first_name}
+- Job title: {target_job_title}
+- Department: {target_department}
+- Company: {company_name}
+- Company domain: {company_domain}"""
+
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=2500,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": static_context, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": dynamic_context},
+            ],
+        }]
     )
 
     raw = response.content[0].text.strip()
@@ -223,16 +231,12 @@ def generate_training_content(
 
     scenario = SCENARIO_LIBRARY.get(scenario_key, SCENARIO_LIBRARY["it_password_reset"])
 
-    prompt = f"""You are a security awareness trainer. An employee just clicked a phishing simulation email
+    # Static instructions (same for every training session with this scenario)
+    static_instructions = f"""You are a security awareness trainer. An employee just clicked a phishing simulation email
 and needs a quick, supportive training session.
 
-EMPLOYEE: {target_first_name}
-COMPANY: {company_name}
 SCENARIO THEY FELL FOR: {scenario['title']}
 EXPECTED RED FLAGS: {', '.join(scenario['red_flags'])}
-
-EMAIL THEY RECEIVED (for context):
-{email_they_received[:1500]}
 
 Create a training module with TWO parts:
 
@@ -241,7 +245,7 @@ PART 1: Training HTML page (max 400 words)
 - "What You Missed" section calling out 3-4 specific red flags from the email above
 - "What a Real Attacker Would Do" section (realistic consequence, not exaggerated)
 - "How to Protect Yourself Next Time" section with 3 practical rules
-- "How to Report Suspicious Emails at {company_name}" section
+- "How to Report Suspicious Emails at your company" section
 - Use inline CSS, no external stylesheets
 - Use color-coded sections (green/yellow/red), readable fonts, professional but warm
 - Include emojis sparingly for visual interest
@@ -264,10 +268,23 @@ Respond with ONLY valid JSON, no markdown fences:
   ]
 }}"""
 
+    # Dynamic context (unique per click event)
+    dynamic_context = f"""EMPLOYEE: {target_first_name}
+COMPANY: {company_name}
+
+EMAIL THEY RECEIVED (for context):
+{email_they_received[:1500]}"""
+
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=4000,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": static_instructions, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": dynamic_context},
+            ],
+        }]
     )
 
     raw = response.content[0].text.strip()
@@ -298,7 +315,7 @@ Write a concise, professional email summary (250-350 words) with:
 Use plain HTML email formatting. Be encouraging and constructive — frame failures as learning opportunities."""
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=1500,
         messages=[{"role": "user", "content": prompt}]
     )

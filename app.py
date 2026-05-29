@@ -94,12 +94,6 @@ if os.getenv("STRIPE_SECRET_KEY"):
 
 # ─── HMAC Utilities ───────────────────────────────────────────────────────────
 
-def _sign_send_id(raw_id: str) -> str:
-    """Return send_id with an HMAC suffix: '<uuid>.<hmac>'."""
-    sig = hmac.new(_HMAC_SECRET, raw_id.encode(), hashlib.sha256).hexdigest()[:16]
-    return f"{raw_id}.{sig}"
-
-
 def _verify_send_id(signed_id: str) -> str | None:
     """Verify the HMAC and return the raw UUID, or None if invalid."""
     parts = signed_id.rsplit(".", 1)
@@ -208,15 +202,21 @@ def dashboard():
     total_targets = Target.query.filter_by(org_id=org_id).count()
     total_campaigns = Campaign.query.filter_by(org_id=org_id).count()
 
-    recent_sends = db.session.query(CampaignSend).join(Campaign).filter(
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    stats = db.session.query(
+        db.func.count(CampaignSend.id).label("sent"),
+        db.func.count(CampaignSend.clicked_at).label("clicked"),
+        db.func.count(CampaignSend.credentials_submitted_at).label("creds"),
+        db.func.count(CampaignSend.reported_at).label("reported"),
+    ).join(Campaign).filter(
         Campaign.org_id == org_id,
-        CampaignSend.sent_at >= datetime.now(timezone.utc) - timedelta(days=30)  # L-1
-    ).all()
+        CampaignSend.sent_at >= cutoff
+    ).one()
 
-    sent_count = len(recent_sends)
-    clicked_count = sum(1 for s in recent_sends if s.clicked_at)
-    creds_count = sum(1 for s in recent_sends if s.credentials_submitted_at)
-    reported_count = sum(1 for s in recent_sends if s.reported_at)
+    sent_count = stats.sent
+    clicked_count = stats.clicked
+    creds_count = stats.creds
+    reported_count = stats.reported
 
     click_rate = (clicked_count / sent_count * 100) if sent_count > 0 else 0
     report_rate = (reported_count / sent_count * 100) if sent_count > 0 else 0
@@ -267,18 +267,19 @@ def upload_targets():
         safe_flash("CSV must contain an 'email' column.", "error")
         return redirect(url_for("targets"))
 
+    existing_emails = {
+        row[0] for row in db.session.query(Target.email)
+        .filter_by(org_id=current_user.org_id).all()
+    }
+
     imported = 0
     for _, row in df.iterrows():
         email = str(row.get("email", "")).strip().lower()
         if not _is_valid_email(email):
             continue
-
-        existing = Target.query.filter_by(
-            org_id=current_user.org_id,
-            email=email
-        ).first()
-        if existing:
+        if email in existing_emails:
             continue
+        existing_emails.add(email)  # deduplicate within the upload
 
         target = Target(
             org_id=current_user.org_id,
@@ -329,11 +330,23 @@ def new_campaign():
         db.session.flush()
 
         org = db.session.get(Organization, current_user.org_id)  # L-2
+
+        valid_ids = [int(tid) for tid in target_ids if str(tid).isdigit()]
+        org_targets = {}
+        if valid_ids:
+            org_targets = {
+                t.id: t for t in Target.query.filter(
+                    Target.id.in_(valid_ids),
+                    Target.org_id == current_user.org_id
+                ).all()
+            }
         sent_count = 0
 
         for target_id in target_ids:
-            target = db.session.get(Target, int(target_id)) if str(target_id).isdigit() else None  # L-2
-            if not target or target.org_id != current_user.org_id:
+            if not str(target_id).isdigit():
+                continue
+            target = org_targets.get(int(target_id))
+            if not target:
                 continue
 
             email_data = generate_phishing_email(
@@ -380,11 +393,15 @@ def campaign_detail(campaign_id):
         "trained": sum(1 for s in sends if s.training_completed_at),
     }
 
+    target_ids = {s.target_id for s in sends}
+    targets_by_id = {}
+    if target_ids:
+        targets_by_id = {t.id: t for t in Target.query.filter(Target.id.in_(target_ids)).all()}
+
     detail_rows = []
     for send in sends:
-        target = db.session.get(Target, send.target_id)  # L-2
         detail_rows.append({
-            "target": target,
+            "target": targets_by_id.get(send.target_id),
             "send": send,
             "status": _compute_status(send)
         })
@@ -575,9 +592,14 @@ def export_campaign(campaign_id):
         abort(403)
 
     sends = CampaignSend.query.filter_by(campaign_id=campaign_id).all()
+    target_ids = {s.target_id for s in sends}
+    targets_by_id = {}
+    if target_ids:
+        targets_by_id = {t.id: t for t in Target.query.filter(Target.id.in_(target_ids)).all()}
+
     rows = []
     for send in sends:
-        target = db.session.get(Target, send.target_id)  # L-2
+        target = targets_by_id.get(send.target_id)
         rows.append({
             "Email": target.email,
             "Name": f"{target.first_name} {target.last_name}",

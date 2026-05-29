@@ -45,6 +45,10 @@ class User(db.Model, UserMixin):
 class Target(db.Model):
     """An employee being phished."""
     __tablename__ = "targets"
+    __table_args__ = (
+        db.UniqueConstraint("org_id", "email", name="uq_target_org_email"),
+        db.Index("ix_target_org_id", "org_id"),
+    )
     id = db.Column(db.Integer, primary_key=True)
     org_id = db.Column(db.Integer, db.ForeignKey("organizations.id"))
     email = db.Column(db.String(200), nullable=False)
@@ -64,6 +68,9 @@ class Target(db.Model):
 class Campaign(db.Model):
     """A phishing campaign sent to targets."""
     __tablename__ = "campaigns"
+    __table_args__ = (
+        db.Index("ix_campaign_org_id", "org_id"),
+    )
     id = db.Column(db.Integer, primary_key=True)
     org_id = db.Column(db.Integer, db.ForeignKey("organizations.id"))
     name = db.Column(db.String(200), nullable=False)
@@ -81,6 +88,10 @@ class Campaign(db.Model):
 class CampaignSend(db.Model):
     """A single email sent to one target in one campaign."""
     __tablename__ = "campaign_sends"
+    __table_args__ = (
+        db.Index("ix_campaign_send_campaign_id", "campaign_id"),
+        db.Index("ix_campaign_send_target_id", "target_id"),
+    )
     # id stores '<uuid>.<hmac>' — max 32 (uuid hex) + 1 (dot) + 16 (hmac) = 49 chars
     id = db.Column(db.String(64), primary_key=True)
     campaign_id = db.Column(db.Integer, db.ForeignKey("campaigns.id"))
